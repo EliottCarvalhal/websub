@@ -12,14 +12,12 @@ import (
 	"net/url"
 	"sync"
 
-	"github.com/google/uuid"
 	"github.com/gorilla/mux"
 )
 
 const defaultPort = "8080"
 
 var (
-	// callback -> topic
 	subs  = make(map[string]*Subscriber)
 	mutex sync.RWMutex
 )
@@ -53,81 +51,62 @@ func postHandler(w http.ResponseWriter, r *http.Request) {
 
 	params := r.Form
 
-	// UUID that requester needs to echo for verification
-	secret := uuid.New().String()
+	mode := params.Get("hub.mode")
+	callback := params.Get("hub.callback")
+	topic := params.Get("hub.topic")
+	secret := params.Get("hub.secret")
+
+	if mode == "" || callback == "" || topic == "" {
+		http.Error(w, "Missing required parameters", http.StatusBadRequest)
+		return
+	}
 
 	// if requesting unsubscribe, we check they're a subscriber before removing them from the map
-	if params.Get("hub.mode") == "unsubscribe" {
+	if mode == "unsubscribe" {
 		fmt.Println("unsubscribing...")
-		mutex.Lock()
-		defer mutex.Unlock()
 
-		cb, ok := subs[params.Get("hub.callback")]
+		mutex.Lock()
+		cb, ok := subs[callback]
+		mutex.Unlock()
+
 		if !ok {
 			http.Error(w, "cannot unsubscribe without being a subscriber", http.StatusBadRequest)
 			return
 		}
 
-		valid := verifyIntent(params.Get("hub.callback"), params.Get("hub.mode"), params.Get("hub.topic"), secret, w)
+		valid := verifyIntent(callback, mode, topic, secret, w)
 
-		if valid {
-			delete(subs, cb.Callback)
+		if !valid {
+			return
 		}
 
+		mutex.Lock()
+		delete(subs, cb.Callback)
+		mutex.Unlock()
+
+		w.WriteHeader(http.StatusNoContent)
 		return
 
-	} else if params.Get("hub.mode") != "subscribe" { //unexpected mode
+	} else if mode != "subscribe" { //unexpected mode
 		http.Error(w, "unsupported hub mode", http.StatusBadRequest)
 		return
 	}
 
-	valid := verifyIntent(params.Get("hub.callback"), params.Get("hub.mode"), params.Get("hub.topic"), secret, w)
+	valid := verifyIntent(callback, mode, topic, secret, w)
 	if !valid {
 		return
 	}
 
 	// add to map
 	mutex.Lock()
-	subs[params.Get("hub.callback")] = &Subscriber{
-		Callback: params.Get("hub.callback"),
-		Topic:    params.Get("hub.topic"),
-		Secret:   params.Get("hub.secret"),
+	subs[callback] = &Subscriber{
+		Callback: callback,
+		Topic:    topic,
+		Secret:   secret,
 	}
 	mutex.Unlock()
 
-	hubBody := &JSONResp{Data: "hello"}
-	jsonBody, err := json.Marshal(hubBody)
-	if err != nil {
-		http.Error(w, "failed to marshal body", http.StatusInternalServerError)
-		return
-	}
-
-	sig := hmac.New(sha256.New, []byte(params.Get("hub.secret")))
-	sig.Write(jsonBody)
-	sigHex := fmt.Sprintf("%x", sig.Sum(nil))
-
-	h := http.Header{}
-	h.Add("Content-Type", "application/json")
-	h.Add("X-Hub-Signature", "sha256="+sigHex)
-
-	callbackURL, err := url.Parse(params.Get("hub.callback"))
-	if err != nil {
-		http.Error(w, "invalid callback URL", http.StatusBadRequest)
-		return
-	}
-
-	_, err = http.DefaultClient.Do(&http.Request{
-		Method: http.MethodPost,
-		URL:    callbackURL,
-		Header: h,
-		Body:   io.NopCloser(bytes.NewReader(jsonBody)),
-	})
-
-	if err != nil {
-		http.Error(w, "failed to call callback url", http.StatusBadRequest)
-		return
-	}
-
+	w.WriteHeader(http.StatusOK)
 }
 
 func verifyIntent(callback, mode, topic, challenge string, w http.ResponseWriter) bool {
